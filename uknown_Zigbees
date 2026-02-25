@@ -1,0 +1,213 @@
+// Version 1.1
+// Zigbee UNKNOWN-manufacturer inventory for HomeyScript (grouped by subzone path, without repeating top "Home")
+// - Lists ONLY Zigbee nodes with UNKNOWN/missing manufacturer
+// - Resolves Zone via Homey device name matching (best-effort)
+// - Ghost Zigbee devices ("Unknown Node — (unknown zone)") are NOT listed; only counted
+// - Group header = zone path WITHOUT the top-level zone name (e.g. "First floor / Bedroom")
+// - Output order inside group: "SubzoneLeaf — DeviceName" (i.e., subzone first, then device)
+// - Exposes tags:
+//   - UnknownManufacturerDevices (multiline, grouped by trimmed zone path, WITHOUT ghosts)
+//   - unknownManufacturerCount (number, WITHOUT ghosts)
+//   - ghostZigbeeCount (number)
+
+async function listZigbeeUnknownManufacturerDevices() {
+  const records = []; // { deviceName, zoneName, zonePathFull, zonePathTrimmed, zoneLeaf }
+  let unknownManufacturerCount = 0;
+  let ghostZigbeeCount = 0;
+
+  // Helpers
+  function normalizeName(s) {
+    return String(s || '').trim().toLowerCase();
+  }
+
+  function isUnknownManufacturer(value) {
+    if (value === null || value === undefined) return true;
+    const s = String(value).trim();
+    if (!s) return true;
+    const sl = s.toLowerCase();
+    return sl === 'unknown' || sl === 'n/a' || sl === 'na' || sl === 'null' || sl === 'undefined';
+  }
+
+  function pickManufacturerFromZigbeeNode(node) {
+    return (
+      node?.manufacturerName ??
+      node?.manufacturer ??
+      node?.vendor ??
+      node?.companyName ??
+      node?.manuf ??
+      null
+    );
+  }
+
+  function compareStrings(a, b) {
+    return String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base' });
+  }
+
+  function isGhost(deviceName, zoneName) {
+    return normalizeName(deviceName) === 'unknown node' && zoneName === '(unknown zone)';
+  }
+
+  function splitPath(path) {
+    return String(path || '')
+      .split(' / ')
+      .map(p => p.trim())
+      .filter(Boolean);
+  }
+
+  function leafFromPath(path) {
+    const parts = splitPath(path);
+    return parts.length ? parts[parts.length - 1] : '(unknown zone)';
+  }
+
+  function trimTopLevel(path) {
+    // Removes the first segment from "Home / X / Y" => "X / Y"
+    const parts = splitPath(path);
+    if (parts.length <= 1) return parts[0] || '(unknown zone)';
+    return parts.slice(1).join(' / ');
+  }
+
+  try {
+    // Zones map (id -> zone)
+    const zones = await Homey.zones.getZones();
+    const zoneById = new Map(Object.entries(zones || {}).map(([id, z]) => [id, z || {}]));
+
+    function getZoneName(zoneId) {
+      if (!zoneId) return '(unknown zone)';
+      const z = zoneById.get(zoneId);
+      return z?.name || '(unknown zone)';
+    }
+
+    function getZonePath(zoneId) {
+      if (!zoneId || !zoneById.has(zoneId)) return '(unknown zone)';
+      const names = [];
+      const seen = new Set();
+      let cur = zoneId;
+
+      while (cur && zoneById.has(cur) && !seen.has(cur)) {
+        seen.add(cur);
+        const z = zoneById.get(cur);
+        if (z?.name) names.push(z.name);
+        cur = z?.parent || null;
+      }
+
+      names.reverse(); // root -> leaf
+      return names.length ? names.join(' / ') : '(unknown zone)';
+    }
+
+    // Devices map + name index
+    const devices = await Homey.devices.getDevices();
+    const devicesByName = new Map(); // normalizedName -> [{ zoneName, zonePath }]
+
+    for (const [, d] of Object.entries(devices || {})) {
+      const name = d?.name || '';
+      const n = normalizeName(name);
+      if (!n) continue;
+
+      const zoneId = d?.zone || null;
+      const zoneName = getZoneName(zoneId);
+      const zonePath = getZonePath(zoneId);
+
+      const entry = { zoneName, zonePath };
+      if (!devicesByName.has(n)) devicesByName.set(n, []);
+      devicesByName.get(n).push(entry);
+    }
+
+    // Zigbee nodes
+    const zigbeeState = await Homey.zigbee.getState();
+    const nodes = Object.values((zigbeeState && zigbeeState.nodes) || {});
+    console.log(`Zigbee nodes found: ${nodes.length}`);
+
+    for (const node of nodes) {
+      const zigbeeName = node?.name || '(unnamed zigbee node)';
+      const manufacturer = pickManufacturerFromZigbeeNode(node);
+      if (!isUnknownManufacturer(manufacturer)) continue;
+
+      const n = normalizeName(zigbeeName);
+      const matches = devicesByName.get(n) || [];
+
+      let zoneName = '(unknown zone)';
+      let zonePathFull = '(unknown zone)';
+
+      if (matches.length === 1) {
+        zoneName = matches[0].zoneName;
+        zonePathFull = matches[0].zonePath;
+      } else if (matches.length > 1) {
+        const zonePaths = [...new Set(matches.map(m => m.zonePath))].filter(Boolean);
+        zoneName = `[Unverified] name collision`;
+        zonePathFull = `[Unverified] ${zonePaths.slice(0, 3).join(' | ')}${zonePaths.length > 3 ? ' | …' : ''}`;
+      }
+
+      if (isGhost(zigbeeName, zoneName)) {
+        ghostZigbeeCount++;
+        continue;
+      }
+
+      const zonePathTrimmed = trimTopLevel(zonePathFull);
+      const zoneLeaf = leafFromPath(zonePathTrimmed);
+
+      records.push({
+        deviceName: zigbeeName,
+        zoneName,
+        zonePathFull,
+        zonePathTrimmed,
+        zoneLeaf,
+      });
+      unknownManufacturerCount++;
+    }
+
+    // Sort by trimmed path (so subzones are ordered), then device name
+    records.sort((a, b) => {
+      const c1 = compareStrings(a.zonePathTrimmed, b.zonePathTrimmed);
+      if (c1) return c1;
+      return compareStrings(a.deviceName, b.deviceName);
+    });
+
+    // Group by trimmed path (no repeated "Home")
+    const groupedLines = [];
+    let currentPath = null;
+
+    for (const r of records) {
+      if (r.zonePathTrimmed !== currentPath) {
+        currentPath = r.zonePathTrimmed;
+        if (groupedLines.length) groupedLines.push('');
+        groupedLines.push(`== ${currentPath} ==`);
+      }
+
+      // Order: SUBZONE (leaf) first, then device name
+      groupedLines.push(`- ${r.zoneLeaf} — ${r.deviceName}`);
+    }
+
+    // Diagnostics
+    console.log(`UNKNOWN-manufacturer Zigbee devices (excluding ghosts): ${unknownManufacturerCount}`);
+    console.log(`Ghost Zigbee devices: ${ghostZigbeeCount}`);
+    console.log('---------------------------------------------');
+    console.log('Unknown-manufacturer devices (grouped by subzone path):');
+    console.log(groupedLines.join('\r\n'));
+    console.log('---------------------------------------------');
+
+    // Tags
+    await tag('UnknownManufacturerDevices', groupedLines.join('\n'));
+    await tag('unknownManufacturerCount', unknownManufacturerCount);
+    await tag('ghostZigbeeCount', ghostZigbeeCount);
+
+    return { unknownManufacturerCount, ghostZigbeeCount, groupedLines };
+  } catch (error) {
+    console.error('Failed: Zigbee UNKNOWN-manufacturer inventory', error);
+    await tag('UnknownManufacturerDevices', '');
+    await tag('unknownManufacturerCount', -1);
+    await tag('ghostZigbeeCount', -1);
+    return { unknownManufacturerCount: -1, ghostZigbeeCount: -1, groupedLines: [] };
+  }
+}
+
+// Execute
+await listZigbeeUnknownManufacturerDevices()
+  .then((result) => {
+    console.log('unknownManufacturerCount (excluding ghosts):', result.unknownManufacturerCount);
+    console.log('ghostZigbeeCount:', result.ghostZigbeeCount);
+  })
+  .catch((error) => {
+    console.error('Error:', error);
+  });
+
+return true;
