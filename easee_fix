@@ -1,0 +1,2005 @@
+/**
+ * HomeyScript
+ * Easee broken ON/OFF Flow repair v1.0
+ *
+ * PURPOSE
+ * -------
+ * Repairs Flows after the Easee app removed the old duplicate
+ * device actions:
+ *
+ *   homey:device:<UUID>:on
+ *   homey:device:<UUID>:off
+ *
+ * The charger itself is still the same Homey device.
+ *
+ * The current control capability is:
+ *
+ *   evcharger_charging
+ *
+ * This script dynamically inspects the CURRENT Flow-card registry
+ * and finds the real replacement card(s). It does NOT guess their IDs.
+ *
+ *
+ * SAFETY
+ * ------
+ * - Default = SOFT RUN.
+ * - Only exact :on and :off ACTION cards for this one Easee charger
+ *   are considered.
+ * - Triggers and conditions are not touched.
+ * - No device IDs are changed.
+ * - If the new Flow-card schema cannot be determined unambiguously,
+ *   the script aborts before modifying anything.
+ * - Supports Regular Flows and Advanced Flows.
+ * - Safe to re-run.
+ */
+
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const DEVICE_ID =
+    'ENTER_YOUR_ID_EASEE_DEVICE_ID';
+
+const DEVICE_URI =
+    `homey:device:${DEVICE_ID}`;
+
+const EXPECTED_DRIVER =
+    'homey:app:no.easee:charger';
+
+const CONTROL_CAPABILITY =
+    'evcharger_charging';
+
+
+// true  = diagnostic / preview only
+// false = actually update Flows
+const softRun =
+    true;
+
+
+// Print detailed card changes.
+const detailedLog =
+    true;
+
+
+// ============================================================================
+// LEGACY CARDS
+// ============================================================================
+
+const OLD_ON_ID =
+    `${DEVICE_URI}:on`;
+
+const OLD_OFF_ID =
+    `${DEVICE_URI}:off`;
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+function clone(value) {
+
+    return JSON.parse(
+        JSON.stringify(value)
+    );
+}
+
+
+function safeJson(value) {
+
+    try {
+
+        return JSON.stringify(value);
+
+    }
+    catch (_) {
+
+        return String(value);
+    }
+}
+
+
+function getFlowName(flow) {
+
+    return (
+        flow?.name
+        ||
+        flow?.title
+        ||
+        flow?.id
+        ||
+        '<unnamed flow>'
+    );
+}
+
+
+function getOwnerId(card) {
+
+    if (
+        typeof card?.ownerId === 'string'
+        &&
+        card.ownerId.length > 0
+    ) {
+
+        return card.ownerId;
+    }
+
+
+    if (
+        typeof card?.id === 'string'
+        &&
+        card.id.startsWith(
+            `${DEVICE_URI}:`
+        )
+    ) {
+
+        return card.id.substring(
+            DEVICE_URI.length + 1
+        );
+    }
+
+
+    return '';
+}
+
+
+function getArgumentDefinitions(card) {
+
+    return Array.isArray(
+        card?.args
+    )
+        ? card.args
+        : [];
+}
+
+
+function cardDescription(card) {
+
+    return [
+
+        card?.id || '',
+        card?.ownerId || '',
+        card?.title || '',
+        card?.titleFormatted || '',
+
+    ]
+        .join(' ')
+        .toLowerCase();
+}
+
+
+function isOwnedByTargetDevice(card) {
+
+    return (
+        card?.ownerUri === DEVICE_URI
+        ||
+        (
+            typeof card?.id === 'string'
+            &&
+            card.id.startsWith(
+                `${DEVICE_URI}:`
+            )
+        )
+    );
+}
+
+
+function isLegacyAction(card) {
+
+    return (
+        card?.id === OLD_ON_ID
+        ||
+        card?.id === OLD_OFF_ID
+    );
+}
+
+
+// ============================================================================
+// LOAD + VALIDATE DEVICE
+// ============================================================================
+
+async function validateDevice() {
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'DEVICE VALIDATION'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    const devices =
+        await Homey.devices.getDevices();
+
+
+    const device =
+        devices[DEVICE_ID];
+
+
+    if (!device) {
+
+        throw new Error(
+            `Easee device not found: ${DEVICE_ID}`
+        );
+    }
+
+
+    console.log(
+        `Name       : ${device.name}`
+    );
+
+    console.log(
+        `ID         : ${device.id}`
+    );
+
+    console.log(
+        `Driver     : ${device.driverId}`
+    );
+
+    console.log(
+        `Class      : ${device.class}`
+    );
+
+
+    if (
+        device.driverId !==
+        EXPECTED_DRIVER
+    ) {
+
+        throw new Error(
+            `Unexpected driver. Expected "${EXPECTED_DRIVER}", got "${device.driverId}".`
+        );
+    }
+
+
+    if (
+        !Array.isArray(
+            device.capabilities
+        )
+        ||
+        !device.capabilities.includes(
+            CONTROL_CAPABILITY
+        )
+    ) {
+
+        throw new Error(
+            `Capability "${CONTROL_CAPABILITY}" is missing on the charger.`
+        );
+    }
+
+
+    const capability =
+        device.capabilitiesObj?.[
+            CONTROL_CAPABILITY
+        ];
+
+
+    if (!capability) {
+
+        throw new Error(
+            `Capability object for "${CONTROL_CAPABILITY}" is missing.`
+        );
+    }
+
+
+    console.log('');
+    console.log(
+        `Control capability : ${capability.id}`
+    );
+
+    console.log(
+        `Type               : ${capability.type}`
+    );
+
+    console.log(
+        `Getable            : ${capability.getable}`
+    );
+
+    console.log(
+        `Setable            : ${capability.setable}`
+    );
+
+    console.log(
+        `Current value      : ${safeJson(capability.value)}`
+    );
+
+
+    if (
+        capability.type !== 'boolean'
+    ) {
+
+        throw new Error(
+            `"${CONTROL_CAPABILITY}" is expected to be boolean but is "${capability.type}".`
+        );
+    }
+
+
+    if (
+        capability.setable !== true
+    ) {
+
+        throw new Error(
+            `"${CONTROL_CAPABILITY}" is not setable. Migration aborted.`
+        );
+    }
+
+
+    return device;
+}
+
+
+// ============================================================================
+// PRINT FLOW CARD REGISTRY CARD
+// ============================================================================
+
+function printRegistryCard(
+    card,
+    prefix = '  '
+) {
+
+    console.log(
+        `${prefix}ID             : ${card.id ?? '<none>'}`
+    );
+
+    console.log(
+        `${prefix}ownerUri       : ${card.ownerUri ?? '<none>'}`
+    );
+
+    console.log(
+        `${prefix}ownerId        : ${card.ownerId ?? '<none>'}`
+    );
+
+    console.log(
+        `${prefix}title          : ${card.title ?? '<none>'}`
+    );
+
+    console.log(
+        `${prefix}titleFormatted : ${card.titleFormatted ?? '<none>'}`
+    );
+
+    console.log(
+        `${prefix}args           : ${safeJson(card.args ?? null)}`
+    );
+}
+
+
+// ============================================================================
+// BOOLEAN VALUE DISCOVERY
+// ============================================================================
+
+function normalizeBooleanValue(
+    value
+) {
+
+    if (
+        value === true
+        ||
+        value === false
+    ) {
+
+        return value;
+    }
+
+
+    if (
+        typeof value === 'number'
+    ) {
+
+        if (value === 1) {
+            return true;
+        }
+
+        if (value === 0) {
+            return false;
+        }
+    }
+
+
+    if (
+        typeof value === 'string'
+    ) {
+
+        const normalized =
+            value
+                .trim()
+                .toLowerCase();
+
+
+        if (
+            [
+                'true',
+                '1',
+                'on',
+                'yes',
+                'start',
+                'started',
+                'enable',
+                'enabled',
+                'charging',
+            ].includes(
+                normalized
+            )
+        ) {
+
+            return true;
+        }
+
+
+        if (
+            [
+                'false',
+                '0',
+                'off',
+                'no',
+                'stop',
+                'stopped',
+                'disable',
+                'disabled',
+                'paused',
+            ].includes(
+                normalized
+            )
+        ) {
+
+            return false;
+        }
+    }
+
+
+    return null;
+}
+
+
+// ============================================================================
+// CLASSIFY SEPARATE START / STOP CARDS
+// ============================================================================
+
+function classifySeparateCard(
+    card
+) {
+
+    const ownerId =
+        getOwnerId(card)
+            .toLowerCase();
+
+
+    const description =
+        cardDescription(card);
+
+
+    /**
+     * First inspect ID / ownerId.
+     *
+     * These patterns are deliberately conservative.
+     */
+    const positiveIdPatterns = [
+
+        `${CONTROL_CAPABILITY}_true`,
+        `${CONTROL_CAPABILITY}_on`,
+        `${CONTROL_CAPABILITY}_start`,
+        `${CONTROL_CAPABILITY}_enable`,
+
+    ];
+
+
+    const negativeIdPatterns = [
+
+        `${CONTROL_CAPABILITY}_false`,
+        `${CONTROL_CAPABILITY}_off`,
+        `${CONTROL_CAPABILITY}_stop`,
+        `${CONTROL_CAPABILITY}_disable`,
+
+    ];
+
+
+    if (
+        positiveIdPatterns.some(
+            pattern =>
+                ownerId === pattern
+                ||
+                ownerId.endsWith(
+                    `:${pattern}`
+                )
+        )
+    ) {
+
+        return true;
+    }
+
+
+    if (
+        negativeIdPatterns.some(
+            pattern =>
+                ownerId === pattern
+                ||
+                ownerId.endsWith(
+                    `:${pattern}`
+                )
+        )
+    ) {
+
+        return false;
+    }
+
+
+    /**
+     * Then inspect human-readable title.
+     */
+    const positiveTitle =
+        (
+            description.includes(
+                'start charging'
+            )
+            ||
+            description.includes(
+                'enable charging'
+            )
+            ||
+            description.includes(
+                'charging on'
+            )
+        );
+
+
+    const negativeTitle =
+        (
+            description.includes(
+                'stop charging'
+            )
+            ||
+            description.includes(
+                'disable charging'
+            )
+            ||
+            description.includes(
+                'charging off'
+            )
+        );
+
+
+    if (
+        positiveTitle
+        &&
+        !negativeTitle
+    ) {
+
+        return true;
+    }
+
+
+    if (
+        negativeTitle
+        &&
+        !positiveTitle
+    ) {
+
+        return false;
+    }
+
+
+    return null;
+}
+
+
+// ============================================================================
+// DISCOVER ONE SET-VALUE CARD
+// ============================================================================
+
+function resolveSetValueCard(
+    candidates
+) {
+
+    const matches =
+        [];
+
+
+    for (
+        const card
+        of candidates
+    ) {
+
+        const ownerId =
+            getOwnerId(card);
+
+        const args =
+            getArgumentDefinitions(card);
+
+
+        const valueArg =
+            args.find(
+                arg =>
+                    arg?.name === 'value'
+            );
+
+
+        const looksLikeSetter =
+            (
+                ownerId.includes(
+                    `${CONTROL_CAPABILITY}_set`
+                )
+                ||
+                ownerId.includes(
+                    `${CONTROL_CAPABILITY}.set`
+                )
+                ||
+                (
+                    ownerId.includes(
+                        CONTROL_CAPABILITY
+                    )
+                    &&
+                    Boolean(valueArg)
+                )
+            );
+
+
+        if (
+            !looksLikeSetter
+            ||
+            !valueArg
+        ) {
+
+            continue;
+        }
+
+
+        let onValue =
+            null;
+
+        let offValue =
+            null;
+
+
+        // --------------------------------------------------------------------
+        // Boolean argument
+        // --------------------------------------------------------------------
+
+        if (
+            valueArg.type === 'boolean'
+        ) {
+
+            onValue =
+                true;
+
+            offValue =
+                false;
+        }
+
+
+        // --------------------------------------------------------------------
+        // Dropdown argument
+        // --------------------------------------------------------------------
+
+        else if (
+            valueArg.type === 'dropdown'
+            &&
+            Array.isArray(
+                valueArg.values
+            )
+        ) {
+
+            for (
+                const option
+                of valueArg.values
+            ) {
+
+                const semantic =
+                    normalizeBooleanValue(
+                        option?.id
+                    );
+
+
+                if (
+                    semantic === true
+                    &&
+                    onValue === null
+                ) {
+
+                    onValue =
+                        option.id;
+                }
+
+
+                if (
+                    semantic === false
+                    &&
+                    offValue === null
+                ) {
+
+                    offValue =
+                        option.id;
+                }
+            }
+        }
+
+
+        if (
+            onValue !== null
+            &&
+            offValue !== null
+        ) {
+
+            matches.push({
+
+                mode:
+                    'set-value',
+
+                card,
+
+                on: {
+                    id:
+                        card.id,
+
+                    args: {
+                        value:
+                            onValue,
+                    },
+                },
+
+                off: {
+                    id:
+                        card.id,
+
+                    args: {
+                        value:
+                            offValue,
+                    },
+                },
+            });
+        }
+    }
+
+
+    if (
+        matches.length === 1
+    ) {
+
+        return matches[0];
+    }
+
+
+    return null;
+}
+
+
+// ============================================================================
+// DISCOVER TWO SEPARATE ACTION CARDS
+// ============================================================================
+
+function resolveSeparateCards(
+    candidates
+) {
+
+    const onCandidates =
+        [];
+
+    const offCandidates =
+        [];
+
+
+    for (
+        const card
+        of candidates
+    ) {
+
+        const args =
+            getArgumentDefinitions(card);
+
+
+        /**
+         * A direct ON/OFF card should require no argument.
+         *
+         * If it has arguments, do not guess.
+         */
+        if (
+            args.length > 0
+        ) {
+
+            continue;
+        }
+
+
+        const semantic =
+            classifySeparateCard(
+                card
+            );
+
+
+        if (
+            semantic === true
+        ) {
+
+            onCandidates.push(
+                card
+            );
+        }
+
+
+        if (
+            semantic === false
+        ) {
+
+            offCandidates.push(
+                card
+            );
+        }
+    }
+
+
+    if (
+        onCandidates.length === 1
+        &&
+        offCandidates.length === 1
+    ) {
+
+        return {
+
+            mode:
+                'separate-cards',
+
+            on: {
+                id:
+                    onCandidates[0].id,
+
+                args:
+                    {},
+            },
+
+            off: {
+                id:
+                    offCandidates[0].id,
+
+                args:
+                    {},
+            },
+
+            onCard:
+                onCandidates[0],
+
+            offCard:
+                offCandidates[0],
+        };
+    }
+
+
+    return null;
+}
+
+
+// ============================================================================
+// FIND CURRENT EASEE CHARGING ACTION CARDS
+// ============================================================================
+
+async function discoverReplacementCards() {
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'CURRENT EASEE FLOW ACTION DISCOVERY'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    const allActions =
+        Object.values(
+            await Homey.flow.getFlowCardActions()
+            || {}
+        );
+
+
+    console.log(
+        `All registered actions: ${allActions.length}`
+    );
+
+
+    const ownedActions =
+        allActions.filter(
+            isOwnedByTargetDevice
+        );
+
+
+    console.log(
+        `Actions owned by Easee Charger: ${ownedActions.length}`
+    );
+
+
+    const candidates =
+        ownedActions.filter(
+            card => {
+
+                const description =
+                    cardDescription(card);
+
+
+                return (
+                    description.includes(
+                        CONTROL_CAPABILITY.toLowerCase()
+                    )
+                    ||
+                    (
+                        description.includes(
+                            'charg'
+                        )
+                        &&
+                        (
+                            description.includes(
+                                'start'
+                            )
+                            ||
+                            description.includes(
+                                'stop'
+                            )
+                            ||
+                            description.includes(
+                                'enable'
+                            )
+                            ||
+                            description.includes(
+                                'disable'
+                            )
+                            ||
+                            description.includes(
+                                'set'
+                            )
+                        )
+                    )
+                );
+            }
+        );
+
+
+    console.log(
+        `Charging-related candidates: ${candidates.length}`
+    );
+
+
+    for (
+        const card
+        of candidates
+    ) {
+
+        console.log('');
+        printRegistryCard(
+            card
+        );
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Prefer explicit separate Start / Stop actions.
+    // ------------------------------------------------------------------------
+
+    const separate =
+        resolveSeparateCards(
+            candidates
+        );
+
+
+    if (separate) {
+
+        console.log('');
+        console.log(
+            'Resolved replacement schema: TWO SEPARATE ACTION CARDS'
+        );
+
+        console.log(
+            `  OLD ON  -> ${separate.on.id}`
+        );
+
+        console.log(
+            `  OLD OFF -> ${separate.off.id}`
+        );
+
+
+        return separate;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Otherwise support a single set-value action.
+    // ------------------------------------------------------------------------
+
+    const setter =
+        resolveSetValueCard(
+            candidates
+        );
+
+
+    if (setter) {
+
+        console.log('');
+        console.log(
+            'Resolved replacement schema: ONE SET-VALUE ACTION CARD'
+        );
+
+        console.log(
+            `  Card    : ${setter.card.id}`
+        );
+
+        console.log(
+            `  ON args : ${safeJson(setter.on.args)}`
+        );
+
+        console.log(
+            `  OFF args: ${safeJson(setter.off.args)}`
+        );
+
+
+        return setter;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Could not resolve safely.
+    // ------------------------------------------------------------------------
+
+    console.log('');
+    console.log(
+        'ERROR: Could not unambiguously determine the new Easee charging actions.'
+    );
+
+    console.log('');
+    console.log(
+        'All actions owned by this charger:'
+    );
+
+
+    for (
+        const card
+        of ownedActions
+    ) {
+
+        console.log('');
+        printRegistryCard(
+            card
+        );
+    }
+
+
+    throw new Error(
+        'Replacement Flow cards could not be resolved safely. Nothing was changed.'
+    );
+}
+
+
+// ============================================================================
+// REPLACE ONE LEGACY ACTION
+// ============================================================================
+
+function migrateAction(
+    card,
+    replacement
+) {
+
+    if (
+        !card
+        ||
+        !isLegacyAction(card)
+    ) {
+
+        return {
+            changed:
+                false,
+
+            card,
+        };
+    }
+
+
+    const before =
+        clone(card);
+
+
+    const after =
+        clone(card);
+
+
+    const target =
+        card.id === OLD_ON_ID
+            ? replacement.on
+            : replacement.off;
+
+
+    after.id =
+        target.id;
+
+
+    after.args =
+        clone(
+            target.args
+        );
+
+
+    /**
+     * Device is unchanged.
+     *
+     * Keep uri/ownerUri when already correct.
+     * If Homey stored either field differently, normalize it.
+     */
+    if (
+        Object.prototype.hasOwnProperty.call(
+            after,
+            'uri'
+        )
+    ) {
+
+        after.uri =
+            DEVICE_URI;
+    }
+
+
+    if (
+        Object.prototype.hasOwnProperty.call(
+            after,
+            'ownerUri'
+        )
+    ) {
+
+        after.ownerUri =
+            DEVICE_URI;
+    }
+
+
+    return {
+
+        changed:
+            true,
+
+        direction:
+            before.id === OLD_ON_ID
+                ? 'ON'
+                : 'OFF',
+
+        before,
+
+        after,
+    };
+}
+
+
+// ============================================================================
+// PRINT CHANGE
+// ============================================================================
+
+function printChange(
+    location,
+    result
+) {
+
+    console.log(
+        `    ${location} / ${result.direction}`
+    );
+
+    console.log(
+        `      ${result.before.id}`
+    );
+
+    console.log(
+        `        -> ${result.after.id}`
+    );
+
+
+    if (
+        detailedLog
+    ) {
+
+        console.log(
+            `      OLD args: ${safeJson(result.before.args ?? {})}`
+        );
+
+        console.log(
+            `      NEW args: ${safeJson(result.after.args ?? {})}`
+        );
+    }
+}
+
+
+// ============================================================================
+// REGULAR FLOWS
+// ============================================================================
+
+async function migrateRegularFlows(
+    replacement
+) {
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'REGULAR FLOWS'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    const flows =
+        await Homey.flow.getFlows();
+
+
+    const stats = {
+
+        matchingFlows:
+            0,
+
+        matchingCards:
+            0,
+
+        wouldUpdate:
+            0,
+
+        updated:
+            0,
+
+        failed:
+            0,
+    };
+
+
+    for (
+        const originalFlow
+        of Object.values(flows)
+    ) {
+
+        if (
+            !Array.isArray(
+                originalFlow.actions
+            )
+        ) {
+
+            continue;
+        }
+
+
+        const matchingIndexes =
+            [];
+
+
+        for (
+            let index = 0;
+            index < originalFlow.actions.length;
+            index++
+        ) {
+
+            if (
+                isLegacyAction(
+                    originalFlow.actions[index]
+                )
+            ) {
+
+                matchingIndexes.push(
+                    index
+                );
+            }
+        }
+
+
+        if (
+            matchingIndexes.length === 0
+        ) {
+
+            continue;
+        }
+
+
+        stats.matchingFlows++;
+
+        stats.matchingCards +=
+            matchingIndexes.length;
+
+
+        const flow =
+            clone(
+                originalFlow
+            );
+
+
+        const changes =
+            [];
+
+
+        for (
+            const index
+            of matchingIndexes
+        ) {
+
+            const result =
+                migrateAction(
+                    flow.actions[index],
+                    replacement
+                );
+
+
+            if (
+                !result.changed
+            ) {
+
+                continue;
+            }
+
+
+            flow.actions[index] =
+                result.after;
+
+
+            changes.push({
+                location:
+                    `ACTION ${index}`,
+
+                result,
+            });
+        }
+
+
+        console.log('');
+        console.log(
+            `FLOW: ${getFlowName(flow)}`
+        );
+
+        console.log(
+            `  ID: ${flow.id}`
+        );
+
+
+        for (
+            const change
+            of changes
+        ) {
+
+            printChange(
+                change.location,
+                change.result
+            );
+        }
+
+
+        if (
+            softRun
+        ) {
+
+            stats.wouldUpdate++;
+
+
+            console.log(
+                `  SOFT RUN: would update ${changes.length} action(s).`
+            );
+
+
+            continue;
+        }
+
+
+        try {
+
+            await Homey.flow.updateFlow({
+                id:
+                    flow.id,
+
+                flow,
+            });
+
+
+            stats.updated++;
+
+
+            console.log(
+                `  UPDATED: ${changes.length} action(s).`
+            );
+
+        }
+        catch (error) {
+
+            stats.failed++;
+
+
+            console.log(
+                '  FAILED'
+            );
+
+            console.log(
+                `    ${error?.description || error?.message || error}`
+            );
+        }
+    }
+
+
+    return stats;
+}
+
+
+// ============================================================================
+// ADVANCED FLOWS
+// ============================================================================
+
+async function migrateAdvancedFlows(
+    replacement
+) {
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'ADVANCED FLOWS'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    const flows =
+        await Homey.flow.getAdvancedFlows();
+
+
+    const stats = {
+
+        matchingFlows:
+            0,
+
+        matchingCards:
+            0,
+
+        wouldUpdate:
+            0,
+
+        updated:
+            0,
+
+        failed:
+            0,
+    };
+
+
+    for (
+        const originalFlow
+        of Object.values(flows)
+    ) {
+
+        if (
+            !originalFlow.cards
+        ) {
+
+            continue;
+        }
+
+
+        const matchingKeys =
+            [];
+
+
+        for (
+            const [
+                cardKey,
+                card
+            ]
+            of Object.entries(
+                originalFlow.cards
+            )
+        ) {
+
+            if (
+                isLegacyAction(card)
+            ) {
+
+                matchingKeys.push(
+                    cardKey
+                );
+            }
+        }
+
+
+        if (
+            matchingKeys.length === 0
+        ) {
+
+            continue;
+        }
+
+
+        stats.matchingFlows++;
+
+        stats.matchingCards +=
+            matchingKeys.length;
+
+
+        const flow =
+            clone(
+                originalFlow
+            );
+
+
+        const changes =
+            [];
+
+
+        for (
+            const cardKey
+            of matchingKeys
+        ) {
+
+            const result =
+                migrateAction(
+                    flow.cards[cardKey],
+                    replacement
+                );
+
+
+            if (
+                !result.changed
+            ) {
+
+                continue;
+            }
+
+
+            flow.cards[cardKey] =
+                result.after;
+
+
+            changes.push({
+                location:
+                    `CARD ${cardKey}`,
+
+                result,
+            });
+        }
+
+
+        console.log('');
+        console.log(
+            `ADVANCED FLOW: ${getFlowName(flow)}`
+        );
+
+        console.log(
+            `  ID: ${flow.id}`
+        );
+
+
+        for (
+            const change
+            of changes
+        ) {
+
+            printChange(
+                change.location,
+                change.result
+            );
+        }
+
+
+        if (
+            softRun
+        ) {
+
+            stats.wouldUpdate++;
+
+
+            console.log(
+                `  SOFT RUN: would update ${changes.length} action(s).`
+            );
+
+
+            continue;
+        }
+
+
+        try {
+
+            await Homey.flow.updateAdvancedFlow({
+
+                id:
+                    flow.id,
+
+                advancedflow: {
+                    cards:
+                        flow.cards,
+                },
+            });
+
+
+            stats.updated++;
+
+
+            console.log(
+                `  UPDATED: ${changes.length} action(s).`
+            );
+
+        }
+        catch (error) {
+
+            stats.failed++;
+
+
+            console.log(
+                '  FAILED'
+            );
+
+            console.log(
+                `    ${error?.description || error?.message || error}`
+            );
+        }
+    }
+
+
+    return stats;
+}
+
+
+// ============================================================================
+// POST VERIFICATION
+// ============================================================================
+
+async function verifyRemainingLegacyCards() {
+
+    const regular =
+        await Homey.flow.getFlows();
+
+    const advanced =
+        await Homey.flow.getAdvancedFlows();
+
+
+    const remaining =
+        [];
+
+
+    // ------------------------------------------------------------------------
+    // Regular Flows
+    // ------------------------------------------------------------------------
+
+    for (
+        const flow
+        of Object.values(regular)
+    ) {
+
+        for (
+            let index = 0;
+            index < (flow.actions || []).length;
+            index++
+        ) {
+
+            const action =
+                flow.actions[index];
+
+
+            if (
+                isLegacyAction(action)
+            ) {
+
+                remaining.push({
+
+                    type:
+                        'Regular',
+
+                    flow:
+                        getFlowName(flow),
+
+                    flowId:
+                        flow.id,
+
+                    location:
+                        `ACTION ${index}`,
+
+                    cardId:
+                        action.id,
+                });
+            }
+        }
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Advanced Flows
+    // ------------------------------------------------------------------------
+
+    for (
+        const flow
+        of Object.values(advanced)
+    ) {
+
+        for (
+            const [
+                cardKey,
+                card
+            ]
+            of Object.entries(
+                flow.cards || {}
+            )
+        ) {
+
+            if (
+                isLegacyAction(card)
+            ) {
+
+                remaining.push({
+
+                    type:
+                        'Advanced',
+
+                    flow:
+                        getFlowName(flow),
+
+                    flowId:
+                        flow.id,
+
+                    location:
+                        `CARD ${cardKey}`,
+
+                    cardId:
+                        card.id,
+                });
+            }
+        }
+    }
+
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'POST-MIGRATION VERIFICATION'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    console.log(
+        `Remaining old :on/:off actions: ${remaining.length}`
+    );
+
+
+    for (
+        const item
+        of remaining
+    ) {
+
+        console.log('');
+
+        console.log(
+            `  ${item.type}: ${item.flow}`
+        );
+
+        console.log(
+            `    ${item.location}`
+        );
+
+        console.log(
+            `    ${item.cardId}`
+        );
+    }
+
+
+    return remaining;
+}
+
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+async function main() {
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'EASEE BROKEN ON/OFF FLOW REPAIR v1.0'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        `Device : ${DEVICE_URI}`
+    );
+
+    console.log(
+        `Mode   : ${softRun ? 'SOFT RUN' : 'LIVE'}`
+    );
+
+    console.log('');
+
+    console.log(
+        `OLD ON : ${OLD_ON_ID}`
+    );
+
+    console.log(
+        `OLD OFF: ${OLD_OFF_ID}`
+    );
+
+
+    await validateDevice();
+
+
+    /**
+     * Resolve the new Flow actions FIRST.
+     *
+     * If this cannot be done unambiguously, an exception is thrown
+     * before any Flow is touched.
+     */
+    const replacement =
+        await discoverReplacementCards();
+
+
+    const regular =
+        await migrateRegularFlows(
+            replacement
+        );
+
+
+    const advanced =
+        await migrateAdvancedFlows(
+            replacement
+        );
+
+
+    console.log('');
+    console.log(
+        '============================================================'
+    );
+
+    console.log(
+        'SUMMARY'
+    );
+
+    console.log(
+        '============================================================'
+    );
+
+
+    console.log(
+        `Replacement mode: ${replacement.mode}`
+    );
+
+    console.log('');
+
+    console.log(
+        'REGULAR FLOWS'
+    );
+
+    console.log(
+        `  Matching Flows : ${regular.matchingFlows}`
+    );
+
+    console.log(
+        `  Broken cards   : ${regular.matchingCards}`
+    );
+
+    console.log(
+        `  Would update   : ${regular.wouldUpdate}`
+    );
+
+    console.log(
+        `  Updated        : ${regular.updated}`
+    );
+
+    console.log(
+        `  Failed         : ${regular.failed}`
+    );
+
+
+    console.log('');
+
+    console.log(
+        'ADVANCED FLOWS'
+    );
+
+    console.log(
+        `  Matching Flows : ${advanced.matchingFlows}`
+    );
+
+    console.log(
+        `  Broken cards   : ${advanced.matchingCards}`
+    );
+
+    console.log(
+        `  Would update   : ${advanced.wouldUpdate}`
+    );
+
+    console.log(
+        `  Updated        : ${advanced.updated}`
+    );
+
+    console.log(
+        `  Failed         : ${advanced.failed}`
+    );
+
+
+    if (
+        softRun
+    ) {
+
+        console.log('');
+        console.log(
+            'SOFT RUN ONLY - nothing was modified.'
+        );
+
+        console.log(
+            'If the discovered ON/OFF mappings above are correct, set:'
+        );
+
+        console.log(
+            '    const softRun = false;'
+        );
+
+        console.log(
+            'and run the script again.'
+        );
+
+    }
+    else {
+
+        await verifyRemainingLegacyCards();
+    }
+
+
+    console.log(
+        '============================================================'
+    );
+}
+
+
+// ============================================================================
+// START
+// ============================================================================
+
+main()
+    .catch(
+        error => {
+
+            console.log('');
+            console.log(
+                '============================================================'
+            );
+
+            console.log(
+                'FATAL ERROR'
+            );
+
+            console.log(
+                '============================================================'
+            );
+
+            console.log(
+                error?.stack
+                ||
+                error?.description
+                ||
+                error?.message
+                ||
+                error
+            );
+
+            console.log('');
+
+            console.log(
+                'No further Flow updates were attempted after this error.'
+            );
+
+            console.log(
+                '============================================================'
+            );
+        }
+    );
